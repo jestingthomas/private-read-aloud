@@ -1,0 +1,53 @@
+{
+  "name": "private-read-aloud",
+  "productName": "Private Read Aloud",
+  "version": "1.1.0",
+  "description": "Offline text-to-speech reader for Windows",
+  "main": "main.js",
+  "author": "Private Read Aloud",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win portable nsis"
+  },
+  "devDependencies": {
+    "electron": "45.2.3",
+    "electron-builder": "26.18.1"
+  },
+  "build": {
+    "appId": "local.private-read-aloud",
+    "productName": "Private Read Aloud",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "index.html",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "onecore-bridge.ps1",
+        "to": "onecore-bridge.ps1"
+      }
+    ],
+    "publish": null,
+    "win": {
+      "target": [
+        "portable",
+        "nsis"
+      ],
+      "signAndEditExecutable": false
+    },
+    "portable": {
+      "artifactName": "PrivateReadAloud-${version}-portable.exe"
+    },
+    "nsis": {
+      "artifactName": "PrivateReadAloud-${version}-setup.exe",
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}

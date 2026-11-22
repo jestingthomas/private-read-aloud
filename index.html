@@ -1,0 +1,411 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; media-src file: blob:; img-src data:; connect-src 'none'">
+<title>Private Read Aloud</title>
+<style>
+  :root {
+    --bg: #f6f6f4; --panel: #ffffff; --text: #1d1d1f; --muted: #6b6b70;
+    --border: #d9d9de; --accent: #2f6fde; --mark: #ffe27a; --mark-text: #1d1d1f;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1b1b1d; --panel: #242427; --text: #ececf0; --muted: #a0a0a8;
+      --border: #3a3a40; --accent: #6c9cff; --mark: #8a6d00; --mark-text: #ffffff;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 14px/1.4 "Segoe UI", system-ui, sans-serif;
+    display: flex; flex-direction: column; padding: 14px; gap: 10px;
+  }
+  .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  button, select {
+    font: inherit; color: var(--text); background: var(--panel);
+    border: 1px solid var(--border); border-radius: 6px; padding: 6px 12px;
+  }
+  button { cursor: pointer; min-width: 72px; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .5; cursor: default; }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  select { max-width: 340px; }
+  label { color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  #rateVal { min-width: 3.2em; color: var(--text); font-variant-numeric: tabular-nums; }
+
+  .editor {
+    position: relative; flex: 1; min-height: 0;
+    border: 1px solid var(--border); border-radius: 8px; background: var(--panel);
+    overflow: hidden;
+  }
+  .editor textarea, .editor .backdrop {
+    position: absolute; inset: 0; margin: 0; padding: 14px 16px;
+    font: 17px/1.6 "Segoe UI", system-ui, sans-serif;
+    white-space: pre-wrap; overflow-wrap: break-word; word-break: normal;
+    overflow-y: scroll; border: 0; letter-spacing: normal;
+  }
+  .editor .backdrop { color: transparent; pointer-events: none; }
+  .editor .backdrop mark { color: transparent; background: var(--mark); border-radius: 3px; }
+  .editor textarea {
+    background: transparent; color: var(--text); resize: none; outline: none;
+  }
+  .editor textarea[readonly] { cursor: default; }
+  .status { color: var(--muted); font-size: 12px; display: flex; justify-content: space-between; gap: 12px; }
+</style>
+</head>
+<body>
+  <div class="toolbar">
+    <button id="play" class="primary" title="Play (Ctrl+Enter)">Play</button>
+    <button id="pause" disabled>Pause</button>
+    <button id="stop" disabled title="Stop (Esc)">Stop</button>
+    <button id="clip" title="Paste clipboard text and read it">Read clipboard</button>
+    <label>Voice <select id="voice"></select></label>
+    <label>Speed <input id="rate" type="range" min="0.5" max="2.5" step="0.05" value="1"><span id="rateVal">1.00×</span></label>
+  </div>
+
+  <div class="editor">
+    <div class="backdrop" id="backdrop" aria-hidden="true"></div>
+    <textarea id="text" spellcheck="false" placeholder="Type or paste text here, then press Play (Ctrl+Enter). Select part of the text to read only that part."></textarea>
+  </div>
+
+  <div class="status">
+    <span id="status">Ready. Offline: nothing leaves this computer.</span>
+    <span id="engine"></span>
+  </div>
+
+<script>
+'use strict';
+const $ = (id) => document.getElementById(id);
+const textEl = $('text'), backdrop = $('backdrop'), voiceSel = $('voice');
+const playBtn = $('play'), pauseBtn = $('pause'), stopBtn = $('stop'), clipBtn = $('clip');
+const rateEl = $('rate'), rateVal = $('rateVal'), statusEl = $('status'), engineEl = $('engine');
+
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+};
+
+// ---------------- Voices ----------------
+let webVoices = [];
+let oneCoreVoices = [];
+
+function rebuildVoiceList() {
+  const saved = store.get('voice') || voiceSel.value;
+  voiceSel.innerHTML = '';
+  const addGroup = (label, items) => {
+    if (!items.length) return;
+    const g = document.createElement('optgroup');
+    g.label = label;
+    for (const it of items) {
+      const o = document.createElement('option');
+      o.value = it.value; o.textContent = it.label;
+      g.appendChild(o);
+    }
+    voiceSel.appendChild(g);
+  };
+  addGroup('Windows voices', webVoices.map(v => ({
+    value: 'web:' + v.voiceURI, label: `${v.name} (${v.lang})`,
+  })));
+  // Bridge voices are a fallback: only list the ones Chromium doesn't already expose.
+  const norm = (s) => s.toLowerCase().replace(/\s*-.*$/, '').replace(/\s+desktop$/, '').trim();
+  const webNames = new Set(webVoices.map(v => norm(v.name)));
+  addGroup('Windows OneCore voices (offline bridge)', oneCoreVoices.filter(v => !webNames.has(norm(v.name))).map(v => ({
+    value: 'onecore:' + v.id, label: `${v.name} (${v.lang})`,
+  })));
+  if (!voiceSel.options.length) {
+    const o = document.createElement('option');
+    o.textContent = 'No local voices found'; o.disabled = true;
+    voiceSel.appendChild(o);
+  }
+  if (saved && [...voiceSel.options].some(o => o.value === saved)) voiceSel.value = saved;
+  updateEngineLabel();
+}
+
+function loadWebVoices() {
+  // Only local voices: nothing is sent to a cloud service.
+  webVoices = speechSynthesis.getVoices().filter(v => v.localService === true);
+  rebuildVoiceList();
+}
+speechSynthesis.addEventListener('voiceschanged', loadWebVoices);
+loadWebVoices();
+
+window.api.onecore.list().then(list => {
+  oneCoreVoices = list || [];
+  rebuildVoiceList();
+  console.log('OneCore voices:', oneCoreVoices.map(v => v.name));
+});
+
+function updateEngineLabel() {
+  const v = voiceSel.value || '';
+  engineEl.textContent = v.startsWith('onecore:') ? 'Engine: OneCore bridge (local)'
+                       : v.startsWith('web:') ? 'Engine: Windows speech (local)' : '';
+}
+voiceSel.addEventListener('change', () => {
+  store.set('voice', voiceSel.value);
+  updateEngineLabel();
+  if (state !== 'idle') { const at = lastIndex; stop(); start(at, rangeEnd); }
+});
+
+// ---------------- Speed ----------------
+const savedRate = parseFloat(store.get('rate'));
+if (savedRate >= 0.5 && savedRate <= 2.5) rateEl.value = savedRate;
+const rate = () => parseFloat(rateEl.value);
+const showRate = () => { rateVal.textContent = rate().toFixed(2) + '×'; };
+showRate();
+let rateTimer = null;
+rateEl.addEventListener('input', () => {
+  showRate();
+  store.set('rate', rateEl.value);
+  if (engine === 'onecore') { audio.playbackRate = rate(); return; }
+  if (engine === 'web' && state === 'playing') {
+    // Web Speech can't change rate mid-utterance; restart from the current word.
+    clearTimeout(rateTimer);
+    rateTimer = setTimeout(() => speakWeb(lastIndex), 150);
+  }
+});
+
+// ---------------- Highlighting ----------------
+const esc = (s) => s.replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+function highlight(start, len) {
+  const t = textEl.value;
+  if (start == null || start < 0) { backdrop.innerHTML = esc(t) + '\n'; return; }
+  backdrop.innerHTML = esc(t.slice(0, start)) + '<mark>' + esc(t.slice(start, start + len)) +
+                       '</mark>' + esc(t.slice(start + len)) + '\n';
+  const m = backdrop.querySelector('mark');
+  if (m) {
+    const top = m.offsetTop, h = textEl.clientHeight;
+    if (top < textEl.scrollTop + 20 || top > textEl.scrollTop + h - 50) {
+      textEl.scrollTop = Math.max(0, top - h / 3);
+    }
+  }
+  backdrop.scrollTop = textEl.scrollTop;
+}
+textEl.addEventListener('scroll', () => { backdrop.scrollTop = textEl.scrollTop; });
+textEl.addEventListener('input', () => highlight(-1));
+
+function wordLenAt(i) {
+  const m = /^[^\s]+/.exec(textEl.value.slice(i));
+  return m ? m[0].length : 0;
+}
+
+// ---------------- Playback state ----------------
+let state = 'idle';     // idle | playing | paused
+let engine = null;      // 'web' | 'onecore'
+let gen = 0;            // bumps on every stop/restart, invalidates stale callbacks
+let lastIndex = 0;      // char index of last spoken word
+let rangeEnd = 0;
+
+function setState(s) {
+  state = s;
+  playBtn.textContent = s === 'paused' ? 'Resume' : 'Play';
+  playBtn.disabled = s === 'playing';
+  pauseBtn.disabled = s !== 'playing';
+  stopBtn.disabled = s === 'idle';
+  textEl.readOnly = s !== 'idle';
+  voiceSel.disabled = false;
+  if (s === 'idle') { engine = null; highlight(-1); }
+}
+
+function setStatus(msg) { statusEl.textContent = msg; }
+
+function play() {
+  if (state === 'paused') return resume();
+  if (state === 'playing') return;
+  const t = textEl.value;
+  let from = 0, to = t.length;
+  if (textEl.selectionEnd > textEl.selectionStart) { from = textEl.selectionStart; to = textEl.selectionEnd; }
+  if (!t.slice(from, to).trim()) { setStatus('Nothing to read.'); return; }
+  start(from, to);
+}
+
+function start(from, to) {
+  rangeEnd = to;
+  lastIndex = from;
+  const v = voiceSel.value || '';
+  if (v.startsWith('onecore:')) startOneCore(v.slice(8), from, to);
+  else if (v.startsWith('web:')) speakWeb(from);
+  else setStatus('No local voice selected.');
+}
+
+function pause() {
+  if (state !== 'playing') return;
+  if (engine === 'web') speechSynthesis.pause();
+  if (engine === 'onecore') audio.pause();
+  setState('paused'); setStatus('Paused.');
+}
+
+function resume() {
+  if (state !== 'paused') return;
+  if (engine === 'web') speechSynthesis.resume();
+  if (engine === 'onecore') audio.play();
+  setState('playing'); setStatus('Reading…');
+}
+
+function stop() {
+  gen++;
+  clearTimeout(rateTimer);
+  speechSynthesis.cancel();
+  stopOneCore();
+  setState('idle'); setStatus('Stopped.');
+}
+
+function finished(myGen) {
+  if (myGen !== gen) return;
+  gen++;
+  setState('idle'); setStatus('Done.');
+}
+
+// ---------------- Engine 1: Web Speech (SAPI desktop voices) ----------------
+function speakWeb(from) {
+  const myGen = ++gen;
+  speechSynthesis.cancel();
+  engine = 'web';
+  const voice = webVoices.find(v => 'web:' + v.voiceURI === voiceSel.value);
+  const u = new SpeechSynthesisUtterance(textEl.value.slice(from, rangeEnd));
+  if (voice) { u.voice = voice; u.lang = voice.lang; }
+  u.rate = rate();
+  u.onboundary = (e) => {
+    if (myGen !== gen || e.name !== 'word') return;
+    const i = from + e.charIndex;
+    lastIndex = i;
+    highlight(i, e.charLength || wordLenAt(i));
+  };
+  u.onend = () => finished(myGen);
+  u.onerror = (e) => {
+    if (myGen !== gen || e.error === 'interrupted' || e.error === 'canceled') return;
+    setStatus('Speech error: ' + e.error); finished(myGen);
+  };
+  speechSynthesis.speak(u);
+  setState('playing'); setStatus('Reading…');
+}
+
+// ---------------- Engine 2: OneCore via local PowerShell bridge ----------------
+const audio = new Audio();
+audio.preservesPitch = true;
+let ocChunks = [], ocIndex = 0, ocCache = new Map(), ocVoice = '', ocRaf = 0, ocCurrent = null;
+
+function splitChunks(text, from, to, max = 600) {
+  // Split on sentence / paragraph boundaries, keeping absolute offsets.
+  const chunks = [];
+  const re = /[^.!?\n]+(?:[.!?]+["')\]]*|\n+|$)/g;
+  const part = text.slice(from, to);
+  let m, cur = null;
+  while ((m = re.exec(part)) && m[0].length) {
+    const s = from + m.index;
+    if (cur && (cur.text.length + m[0].length > max || /\n\n/.test(cur.text))) { chunks.push(cur); cur = null; }
+    if (!cur) cur = { start: s, text: '' };
+    cur.text += m[0];
+    while (cur.text.length > max) {                       // very long sentence: hard split on a space
+      let cut = cur.text.lastIndexOf(' ', max); if (cut < max / 2) cut = max;
+      chunks.push({ start: cur.start, text: cur.text.slice(0, cut) });
+      cur = { start: cur.start + cut, text: cur.text.slice(cut) };
+    }
+  }
+  if (cur) chunks.push(cur);
+  return chunks.filter(c => c.text.trim());
+}
+
+function synthChunk(i) {
+  if (i >= ocChunks.length) return null;
+  if (!ocCache.has(i)) ocCache.set(i, window.api.onecore.synth(ocVoice, ocChunks[i].text));
+  return ocCache.get(i);
+}
+
+function releaseResult(p) {
+  if (p) p.then(r => window.api.onecore.release(r.path)).catch(() => {});
+}
+
+function startOneCore(voiceId, from, to) {
+  const myGen = ++gen;
+  speechSynthesis.cancel();
+  stopOneCore();
+  engine = 'onecore';
+  ocVoice = voiceId;
+  ocChunks = splitChunks(textEl.value, from, to);
+  ocIndex = 0;
+  setState('playing'); setStatus('Preparing voice…');
+  playOneCoreChunk(myGen);
+}
+
+async function playOneCoreChunk(myGen) {
+  if (myGen !== gen) return;
+  if (ocIndex >= ocChunks.length) return finished(myGen);
+  const chunk = ocChunks[ocIndex];
+  let res;
+  try { res = await synthChunk(ocIndex); }
+  catch (e) { if (myGen === gen) { setStatus('OneCore error: ' + e.message); finished(myGen); } return; }
+  if (myGen !== gen) return;
+  ocCache.delete(ocIndex);
+  ocCurrent = res;
+  synthChunk(ocIndex + 1);                       // prefetch next chunk while this one plays
+  audio.src = res.url;
+  audio.playbackRate = rate();
+  audio.onended = () => {
+    if (myGen !== gen) return;
+    window.api.onecore.release(res.path);
+    ocCurrent = null;
+    ocIndex++;
+    playOneCoreChunk(myGen);
+  };
+  try { await audio.play(); } catch (e) { if (myGen === gen) setStatus('Audio error: ' + e.message); return; }
+  audio.playbackRate = rate();
+  if (state === 'paused') audio.pause(); else setStatus('Reading…');
+
+  const cues = res.cues;                          // [ms, startPos, endPos(inclusive)]
+  let shown = -1;
+  const tick = () => {
+    if (myGen !== gen || ocCurrent !== res) return;
+    const ms = audio.currentTime * 1000;
+    let k = shown;
+    while (k + 1 < cues.length && cues[k + 1][0] <= ms) k++;
+    if (k !== shown && k >= 0) {
+      shown = k;
+      const i = chunk.start + cues[k][1];
+      lastIndex = i;
+      highlight(i, cues[k][2] - cues[k][1] + 1);
+    }
+    ocRaf = requestAnimationFrame(tick);
+  };
+  cancelAnimationFrame(ocRaf);
+  ocRaf = requestAnimationFrame(tick);
+}
+
+function stopOneCore() {
+  cancelAnimationFrame(ocRaf);
+  audio.onended = null;
+  audio.pause();
+  audio.removeAttribute('src');
+  audio.load();
+  if (ocCurrent) { window.api.onecore.release(ocCurrent.path); ocCurrent = null; }
+  for (const p of ocCache.values()) releaseResult(p);
+  ocCache.clear();
+}
+
+// ---------------- Buttons & keys ----------------
+playBtn.addEventListener('click', play);
+pauseBtn.addEventListener('click', pause);
+stopBtn.addEventListener('click', stop);
+clipBtn.addEventListener('click', async () => {
+  const t = await window.api.readClipboard();
+  if (!t || !t.trim()) { setStatus('Clipboard has no text.'); return; }
+  if (state !== 'idle') stop();
+  textEl.value = t;
+  textEl.setSelectionRange(0, 0);
+  textEl.scrollTop = 0;
+  highlight(-1);
+  play();
+});
+
+document.addEventListener('keydown', (e) => {
+  if (e.ctrlKey && e.key === 'Enter') { e.preventDefault(); play(); }
+  else if (e.key === 'Escape') { e.preventDefault(); stop(); }
+});
+
+setState('idle');
+textEl.focus();
+</script>
+</body>
+</html>
